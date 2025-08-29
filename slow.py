@@ -39,6 +39,16 @@ ACCOUNT_BALANCE = 200_000
 RISK_PER_TRADE = 3000
 PIP_VALUE_PER_LOT = 1.0
 
+# ─── PROGRESS TRACKING ──────────────────────────────────────────────────────
+PROGRESS_PRINT_EVERY_DAYS = 25
+PROGRESS_PRINT_EVERY_SECONDS = 20
+START_TS = None
+ELIGIBLE_DATES = []
+ELIGIBLE_TOTAL = 0
+eligible_done = 0
+trades_closed_done = 0
+last_progress_log_ts = None
+
 
 os.makedirs("charts/trades", exist_ok=True)
 os.makedirs("charts/html", exist_ok=True)
@@ -191,7 +201,7 @@ def find_real_fvgs_custom(df):
 
 
 def simulate_trade(df_1m, bos_time, fractal_time, direction, df_full, sweep_time, daily_fvgs):
-    global total_sl2, total_tp5, total_sl5, total_skips, ACCOUNT_BALANCE, LIQUIDATED_COUNT
+    global total_sl2, total_tp5, total_sl5, total_skips, ACCOUNT_BALANCE, LIQUIDATED_COUNT, trades_closed_done
     global last_trade_month
     current_month = bos_time.strftime('%Y-%m')
 
@@ -344,6 +354,7 @@ def simulate_trade(df_1m, bos_time, fractal_time, direction, df_full, sweep_time
                 "tp2_px": tp2,
                 "balance": ACCOUNT_BALANCE
             })
+            trades_closed_done += 1
             if ACCOUNT_BALANCE <= 180_000 and VERBOSE:
                 print(f"💥 Account liquidated at {row.time}. Resetting to 200,000 USD.")
             if ACCOUNT_BALANCE <= 180_000:
@@ -387,6 +398,7 @@ def simulate_trade(df_1m, bos_time, fractal_time, direction, df_full, sweep_time
                 "tp2_px": tp2,
                 "balance": ACCOUNT_BALANCE
             })
+            trades_closed_done += 1
             if ACCOUNT_BALANCE <= 180_000 and VERBOSE:
                 print(f"💥 Account liquidated at {row.time}. Resetting to 200,000 USD.")
             if ACCOUNT_BALANCE <= 180_000:
@@ -425,6 +437,7 @@ def simulate_trade(df_1m, bos_time, fractal_time, direction, df_full, sweep_time
                 "tp2_px": tp2,
                 "balance": ACCOUNT_BALANCE
             })
+            trades_closed_done += 1
             if ACCOUNT_BALANCE <= 180_000 and VERBOSE:
                 print(f"💥 Account liquidated at {row.time}. Resetting to 200,000 USD.")
             if ACCOUNT_BALANCE <= 180_000:
@@ -469,6 +482,7 @@ def detect_bos(df_1m, sweep_dir, sweep_time):
 
 
 def detect_sweep_and_bos(df_15m, df_1m_all, daily_15m, daily_1m):
+    global eligible_done, trades_closed_done, last_progress_log_ts, START_TS, ELIGIBLE_TOTAL
 
     for day, day_15m in daily_15m.items():
         day_1m = daily_1m.get(day)
@@ -568,6 +582,36 @@ def detect_sweep_and_bos(df_15m, df_1m_all, daily_15m, daily_1m):
             if VERBOSE:
                 print(f"Error on {day_date}: {e}")
             continue
+        finally:
+            eligible_done += 1
+            now = datetime.now()
+            need_print = (eligible_done % PROGRESS_PRINT_EVERY_DAYS == 0) or \
+                         ((now - last_progress_log_ts).total_seconds() > PROGRESS_PRINT_EVERY_SECONDS)
+            if need_print and ELIGIBLE_TOTAL:
+                elapsed = now - START_TS
+                elapsed_sec = int(elapsed.total_seconds())
+                elapsed_str = str(timedelta(seconds=elapsed_sec))
+                remaining_days = ELIGIBLE_TOTAL - eligible_done
+                progress_pct = eligible_done / ELIGIBLE_TOTAL * 100
+                avg_per_day = elapsed_sec / eligible_done if eligible_done else 0
+                eta_seconds = avg_per_day * remaining_days
+                eta_str = str(timedelta(seconds=int(eta_seconds)))
+                est_trades_total = (trades_closed_done / max(1, eligible_done)) * ELIGIBLE_TOTAL
+                est_trades_left = max(0, round(est_trades_total - trades_closed_done))
+                print(
+                    f"⏱ Progress: {eligible_done:,}/{ELIGIBLE_TOTAL:,} days ({progress_pct:.1f}%) | "
+                    f"Trades closed: {trades_closed_done} | Days left: {remaining_days:,} | "
+                    f"Elapsed: {elapsed_str} | ETA: {eta_str} | ~Trades left: {est_trades_left} (est)"
+                )
+                last_progress_log_ts = now
+    # Final summary
+    if START_TS is not None:
+        total_elapsed = datetime.now() - START_TS
+        total_elapsed_str = str(timedelta(seconds=int(total_elapsed.total_seconds())))
+        print(
+            f"✅ Done: {eligible_done:,}/{ELIGIBLE_TOTAL:,} days | Trades closed: {trades_closed_done} | "
+            f"Total time: {total_elapsed_str}"
+        )
 
 
 def print_trade_summary():
@@ -709,11 +753,35 @@ def print_trade_summary():
 
 
 if __name__ == '__main__':
+
     df_15m = load_and_cache("2015-2025M15.csv", "2015-2025M15.pkl")
     df_1m = load_and_cache("2015-2025M1.csv", "2015-2025M1.pkl")
 
     daily_15m = build_daily_map(df_15m)
     daily_1m = build_daily_map(df_1m)
+
+    START_TS = datetime.now()
+    ELIGIBLE_DATES = []
+    for day, day_15m in daily_15m.items():
+        day_1m = daily_1m.get(day)
+        if day_1m is None:
+            continue
+        weekday = day_15m['weekday'].iloc[0]
+        if weekday in SKIP_WEEKDAYS:
+            continue
+        if len(day_15m) < 20 or len(day_1m) < 100:
+            continue
+        ELIGIBLE_DATES.append(day)
+    ELIGIBLE_TOTAL = len(ELIGIBLE_DATES)
+    eligible_done = 0
+    trades_closed_done = 0
+    last_progress_log_ts = START_TS
+    if ELIGIBLE_TOTAL:
+        print(
+            f"🚀 Backtest started | Eligible days: {ELIGIBLE_TOTAL:,} | From: {min(ELIGIBLE_DATES).date()} to {max(ELIGIBLE_DATES).date()}"
+        )
+    else:
+        print("🚀 Backtest started | Eligible days: 0")
 
     detect_sweep_and_bos(df_15m, df_1m, daily_15m, daily_1m)
     print("1-Minute Data Range:")
