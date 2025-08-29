@@ -5,6 +5,7 @@ import matplotlib.dates as mdates
 import os
 from datetime import datetime, time, timedelta
 from time import perf_counter
+import math
 
 # progress bar (graceful fallback if tqdm missing)
 try:
@@ -33,8 +34,16 @@ trade_logs = []
 day_stats = {i: {'SL2': 0, 'SL5': 0, 'TP5': 0} for i in range(7)}
 
 ACCOUNT_BALANCE = 100_000
-RISK_PER_TRADE = 2000
-PIP_VALUE_PER_LOT = 1.0
+RISK_PER_TRADE = 2000  # legacy default, replaced by dynamic risk rules
+PIP_VALUE_PER_LOT = 100.0
+
+RISK_FULL = 2500.0
+SL_THRESHOLD_FULL_RISK = 3.2
+MAX_LOT = 7.8
+MAX_FREE_MARGIN = 90_000.0
+MARGIN_PER_LOT_BUY = 11467.02
+MARGIN_PER_LOT_SELL = 11466.06
+LOT_STEP = 0.01
 
 os.makedirs("charts/trades", exist_ok=True)
 os.makedirs("charts/html", exist_ok=True)
@@ -180,9 +189,24 @@ def simulate_trade(df_1m, bos_time, fractal_time, direction, df_full, sweep_time
         total_skips += 1
         return
 
-    lot_size = RISK_PER_TRADE / (stop_distance * PIP_VALUE_PER_LOT)
+    per_lot_margin = MARGIN_PER_LOT_BUY if direction == 'BOS Up' else MARGIN_PER_LOT_SELL
+    lots_by_margin = math.floor((MAX_FREE_MARGIN / per_lot_margin) / LOT_STEP) * LOT_STEP
+    lot_cap_total = min(MAX_LOT, lots_by_margin)
+
+    if stop_distance >= SL_THRESHOLD_FULL_RISK:
+        risk_this_trade = RISK_FULL
+        lots_planned = risk_this_trade / (PIP_VALUE_PER_LOT * stop_distance)
+    else:
+        if lot_cap_total < LOT_STEP:
+            if DEBUG:
+                print("    ⛔ Not enough margin for min lot.")
+            total_skips += 1
+            return
+        lots_planned = lot_cap_total
+        risk_this_trade = lots_planned * PIP_VALUE_PER_LOT * stop_distance
+
     if DEBUG:
-        print(f"    📊 Lot size: {lot_size:.2f} (Stop distance: {stop_distance:.2f})")
+        print(f"    📊 Lot size: {lots_planned:.2f} (Stop distance: {stop_distance:.2f})")
 
     after_entry = df_full[df_full['time'] > entry_time]
     tp1_hit = False
@@ -196,9 +220,10 @@ def simulate_trade(df_1m, bos_time, fractal_time, direction, df_full, sweep_time
         # SL before TP1
         if not tp1_hit and ((direction == 'BOS Up' and low <= sl) or
                             (direction == 'BOS Down' and high >= sl)):
-            if DEBUG: print(f"    ❌ SL HIT at {t} → -{RISK_PER_TRADE:.2f} USD")
-            _record_trade(entry_time, t, -RISK_PER_TRADE, direction,
-                          stop_distance, fvg_range, entry_price, close, sl, tp1, tp2)
+            if DEBUG: print(f"    ❌ SL HIT at {t} → -{risk_this_trade:.2f} USD")
+            _record_trade(entry_time, t, -risk_this_trade, direction,
+                          stop_distance, fvg_range, entry_price, close, sl, tp1, tp2,
+                          risk_this_trade, lots_planned)
             return
 
         # TP1 hit
@@ -210,45 +235,50 @@ def simulate_trade(df_1m, bos_time, fractal_time, direction, df_full, sweep_time
         # SL after TP1
         if tp1_hit and ((direction == 'BOS Up' and low <= sl) or
                         (direction == 'BOS Down' and high >= sl)):
-            profit = (0.8 * 3 - 0.2) * RISK_PER_TRADE
+            profit = (0.8 * 3 - 0.2) * risk_this_trade
             if DEBUG: print(f"    🟡 Final SL after TP1 at {t} → +{profit:.2f} USD")
             _record_trade(entry_time, t, profit, direction,
-                          stop_distance, fvg_range, entry_price, close, sl, tp1, tp2)
+                          stop_distance, fvg_range, entry_price, close, sl, tp1, tp2,
+                          risk_this_trade, lots_planned)
             return
 
         # TP2 hit
         if tp1_hit and ((direction == 'BOS Up' and high >= tp2) or
                         (direction == 'BOS Down' and low <= tp2)):
-            profit = (0.8 * 3 + 0.2 * 6) * RISK_PER_TRADE
+            profit = (0.8 * 3 + 0.2 * 6) * risk_this_trade
             if DEBUG: print(f"    🏁 TP2 HIT at {t} → +{profit:.2f} USD")
             _record_trade(entry_time, t, profit, direction,
-                          stop_distance, fvg_range, entry_price, close, sl, tp1, tp2)
+                          stop_distance, fvg_range, entry_price, close, sl, tp1, tp2,
+                          risk_this_trade, lots_planned)
             return
 
     total_skips += 1  # no TP/SL hit
 
 def _record_trade(entry_time, exit_time, pnl, direction, stop_distance, fvg_range,
-                  entry_px, exit_px, sl, tp1, tp2):
+                  entry_px, exit_px, sl, tp1, tp2, risk_used, lots_planned):
     global total_sl2, total_tp5, total_sl5, ACCOUNT_BALANCE, LIQUIDATED_COUNT
-    # update counters and balance (identical amounts to original)
-    if pnl == -RISK_PER_TRADE:
+    if pnl == -risk_used:
         total_sl2 += pnl
-    elif pnl > 0 and abs(pnl - ((0.8 * 3 - 0.2) * RISK_PER_TRADE)) < 1e-9:
+        day_bucket = 'SL2'
+    elif abs(pnl - ((0.8 * 3 - 0.2) * risk_used)) < 1e-9:
         total_sl5 += pnl
+        day_bucket = 'SL5'
     else:
         total_tp5 += pnl
+        day_bucket = 'TP5'
 
     ACCOUNT_BALANCE += pnl
     equity_time.append(exit_time)
     equity_curve.append(ACCOUNT_BALANCE)
 
-    # weekday stats
-    day_stats[entry_time.weekday()]['SL2' if pnl < 0 else ('SL5' if pnl < (3.6*RISK_PER_TRADE) else 'TP5')] += 1
+    day_stats[entry_time.weekday()][day_bucket] += 1
 
     trade_logs.append({
         "entry_time": entry_time,
         "exit_time": exit_time,
         "pnl": pnl,
+        "risk": risk_used,
+        "lots": lots_planned,
         "direction": "BUY" if direction == "BOS Up" else "SELL",
         "sl_distance": stop_distance,
         "fvg_size": fvg_range,
@@ -415,15 +445,15 @@ def print_trade_summary():
     # Save trade logs
     if trade_logs:
         df_full = pd.DataFrame(trade_logs)[[
-            "entry_time", "exit_time", "pnl", "sl_distance", "fvg_size", "direction",
+            "entry_time", "exit_time", "pnl", "risk", "lots", "sl_distance", "fvg_size", "direction",
             "entry_px", "exit_px", "sl_px", "tp1_px", "tp2_px", "balance"
         ]].copy()
 
-        float_cols = ["pnl", "sl_distance", "fvg_size", "entry_px", "exit_px",
+        float_cols = ["pnl", "risk", "lots", "sl_distance", "fvg_size", "entry_px", "exit_px",
                       "sl_px", "tp1_px", "tp2_px", "balance"]
         df_full[float_cols] = df_full[float_cols].round(5)
         df_full.to_csv("charts/trades_full.csv", index=False)
-        df_full[["entry_time", "exit_time", "direction", "pnl"]].to_csv("charts/trades_lite.csv", index=False)
+        df_full[["entry_time", "exit_time", "direction", "pnl", "risk", "lots"]].to_csv("charts/trades_lite.csv", index=False)
         print("📁 Trade logs saved to: trades_full.csv and trades_lite.csv")
 
     # Save monthly pnl + withdrawals snapshot
