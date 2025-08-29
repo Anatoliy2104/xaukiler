@@ -1,16 +1,20 @@
-import pandas as pd
-import pytz
-import matplotlib.pyplot as plt
+import os
+from pathlib import Path
+from datetime import datetime, time, timedelta
+
 import matplotlib.dates as mdates
 import matplotlib.patches as patches
+import matplotlib.pyplot as plt
+import pandas as pd
+import pytz
 import plotly.graph_objects as go
-import os
-from datetime import datetime, time, timedelta
+
 from fractal import find_fractal_highs_lows
 
 NY_TZ = pytz.timezone("America/New_York")
 
 DEBUG = False
+VERBOSE = False
 
 # Summary counters (money-mapped)
 total_sl2 = 0
@@ -40,6 +44,38 @@ os.makedirs("charts/trades", exist_ok=True)
 os.makedirs("charts/html", exist_ok=True)
 os.makedirs("charts/equity_yearly", exist_ok=True)
 
+
+CACHE_DIR = Path("cache")
+CACHE_DIR.mkdir(exist_ok=True)
+
+
+def load_and_cache(csv_path: str, cache_name: str) -> pd.DataFrame:
+    """Load CSV data with heavy parsing once, then reuse a cached binary."""
+    cache_file = CACHE_DIR / cache_name
+    if cache_file.exists():
+        df = pd.read_pickle(cache_file)
+    else:
+        df = pd.read_csv(csv_path)
+        rename_map = {
+            'Gmt time': 'time',
+            'Open': 'open',
+            'High': 'high',
+            'Low': 'low',
+            'Close': 'close',
+            'Volume': 'volume'
+        }
+        df.rename(columns=rename_map, inplace=True)
+        df['time'] = pd.to_datetime(df['time'], format='%Y-%m-%d %H:%M:%S')
+        df['time'] = df['time'].dt.tz_localize('Etc/GMT-3').dt.tz_convert('America/New_York')
+        df['date'] = df['time'].dt.normalize()
+        df['weekday'] = df['time'].dt.weekday
+        df.to_pickle(cache_file)
+    return df
+
+
+def build_daily_map(df: pd.DataFrame) -> dict:
+    """Pre-group DataFrame rows by their date for O(1) day access."""
+    return {d: g.reset_index(drop=True) for d, g in df.groupby('date')}
 
 
 def find_fractal_highs_lows(df):
@@ -167,7 +203,8 @@ def simulate_trade(df_1m, bos_time, fractal_time, direction, df_full, sweep_time
             withdrawn = ACCOUNT_BALANCE - 200_000
             WITHDRAWAL_LOG.append((last_trade_month, withdrawn))
             ACCOUNT_BALANCE = 200_000
-            print(f"💸 Withdrawal of ${withdrawn:.2f} on {last_trade_month}. Balance reset to 200,000.")
+            if VERBOSE:
+                print(f"💸 Withdrawal of ${withdrawn:.2f} on {last_trade_month}. Balance reset to 200,000.")
         last_trade_month = current_month
 
     dir_match = 'bullish' if direction == 'BOS Up' else 'bearish'
@@ -178,7 +215,8 @@ def simulate_trade(df_1m, bos_time, fractal_time, direction, df_full, sweep_time
         ]
 
     if valid_fvgs.empty:
-        print("    ⛔ No valid FVG found between fractal and BOS.")
+        if VERBOSE:
+            print("    ⛔ No valid FVG found between fractal and BOS.")
         return
 
     fvg = valid_fvgs.iloc[0]
@@ -188,25 +226,29 @@ def simulate_trade(df_1m, bos_time, fractal_time, direction, df_full, sweep_time
     entry_price = (fvg_top + fvg_bottom) / 2
 
     # Get 1m candles after BOS
-    bos_idx = df_1m.index.get_loc(df_1m[df_1m['time'] == bos_time].index[0])
+    time_to_idx = {t: i for i, t in enumerate(df_1m['time'])}
+    bos_idx = time_to_idx.get(bos_time)
+    if bos_idx is None:
+        return
     after_bos = df_1m.iloc[bos_idx + 1:]
 
     # Wait for price to leave FVG and return
     left_fvg = False
     entry_time = None
-    for _, row in after_bos.iterrows():
+    for row in after_bos.itertuples(index=False):
         if not left_fvg:
-            if direction == 'BOS Up' and row['low'] > fvg_top:
+            if direction == 'BOS Up' and row.low > fvg_top:
                 left_fvg = True
-            elif direction == 'BOS Down' and row['high'] < fvg_bottom:
+            elif direction == 'BOS Down' and row.high < fvg_bottom:
                 left_fvg = True
             continue
-        if row['low'] <= entry_price <= row['high']:
-            entry_time = row['time']
+        if row.low <= entry_price <= row.high:
+            entry_time = row.time
             break
 
     if not entry_time:
-        print("    ⛔ Entry not triggered.")
+        if VERBOSE:
+            print("    ⛔ Entry not triggered.")
         total_skips += 1
         return
     # Get latest ATR before entry
@@ -223,13 +265,15 @@ def simulate_trade(df_1m, bos_time, fractal_time, direction, df_full, sweep_time
         total_skips += 1
         return'''
 
-    if entry_time.hour >= 22: #or entry_time.weekday() == 3:
-        print(f"    ⛔ Entry at {entry_time} skipped.")
+    if entry_time.hour >= 22:  # or entry_time.weekday() == 3:
+        if VERBOSE:
+            print(f"    ⛔ Entry at {entry_time} skipped.")
         total_skips += 1
         return
 
-    print(f"    📥 ENTRY at {entry_time} | Price: {entry_price:.2f}")
-    print(f"    🔍 FVG Time: {fvg_time} | FVG Range: {fvg_bottom:.2f} - {fvg_top:.2f}")
+    if VERBOSE:
+        print(f"    📥 ENTRY at {entry_time} | Price: {entry_price:.2f}")
+        print(f"    🔍 FVG Time: {fvg_time} | FVG Range: {fvg_bottom:.2f} - {fvg_top:.2f}")
 
     window_df = df_full[(df_full['time'] >= sweep_time) & (df_full['time'] <= entry_time)]
     fractal_highs, fractal_lows = find_fractal_highs_lows(window_df)
@@ -262,135 +306,131 @@ def simulate_trade(df_1m, bos_time, fractal_time, direction, df_full, sweep_time
         return
 
     if stop_distance < 1.67:
-        print(f"    ⛔ SL filter: stop_distance={stop_distance:.2f} < {1.67} → Skipping trade")
+        if VERBOSE:
+            print(f"    ⛔ SL filter: stop_distance={stop_distance:.2f} < {1.67} → Skipping trade")
         total_skips += 1
         return
 
     #lot_size = RISK_PER_TRADE / (stop_distance * PIP_VALUE_PER_LOT)
     #print(f"    📊 Lot size: {lot_size:.2f} (Stop distance: {stop_distance:.2f})")
 
-    after_entry = df_full[df_full['time'] > entry_time]
+    after_entry = df_full[df_full['time'] > entry_time].reset_index(drop=True)
     tp1_hit = False
 
-    for _, row in after_entry.iterrows():
+    for row in after_entry.itertuples(index=False):
         # 🔻 SL before TP1
-        if not tp1_hit and ((direction == 'BOS Up' and row['low'] <= sl) or
-                            (direction == 'BOS Down' and row['high'] >= sl)):
-
-            print(f"    ❌ SL HIT at {row['time']} → -{RISK_PER_TRADE:.2f} USD")
+        if not tp1_hit and ((direction == 'BOS Up' and row.low <= sl) or
+                            (direction == 'BOS Down' and row.high >= sl)):
+            if VERBOSE:
+                print(f"    ❌ SL HIT at {row.time} → -{RISK_PER_TRADE:.2f} USD")
             total_sl2 += -RISK_PER_TRADE
             ACCOUNT_BALANCE -= RISK_PER_TRADE
-            print(f"    📉 New Account Balance: ${ACCOUNT_BALANCE:,.2f}")
-            equity_time.append(row['time'])
+            if VERBOSE:
+                print(f"    📉 New Account Balance: ${ACCOUNT_BALANCE:,.2f}")
+            equity_time.append(row.time)
             equity_curve.append(ACCOUNT_BALANCE)
             day_stats[entry_time.weekday()]['SL2'] += 1
             trade_logs.append({
                 "entry_time": entry_time,
-                "exit_time": row['time'],
+                "exit_time": row.time,
                 "pnl": -RISK_PER_TRADE,
                 "direction": "BUY" if direction == "BOS Up" else "SELL",
                 "sl_distance": stop_distance,
                 "fvg_size": fvg_range,
                 "entry_px": entry_price,
-                "exit_px": row['close'],
+                "exit_px": row.close,
                 "sl_px": sl,
                 "tp1_px": tp1,
                 "tp2_px": tp2,
                 "balance": ACCOUNT_BALANCE
             })
-
-            exit_time = row['time']
-            result_label = "SL2"
-            #plot_trade_chart_interactive(df_full, entry_time, exit_time, entry_price, sl, tp1, tp2, result_label)
+            if ACCOUNT_BALANCE <= 180_000 and VERBOSE:
+                print(f"💥 Account liquidated at {row.time}. Resetting to 200,000 USD.")
             if ACCOUNT_BALANCE <= 180_000:
-                print(f"💥 Account liquidated at {row['time']}. Resetting to 200,000 USD.")
                 LIQUIDATED_COUNT += 1
                 ACCOUNT_BALANCE = 200_000
-                equity_time.append(row['time'])
+                equity_time.append(row.time)
                 equity_curve.append(ACCOUNT_BALANCE)
-
             return
 
         # ✅ TP1 hit
-        if not tp1_hit and ((direction == 'BOS Up' and row['high'] >= tp1) or
-                            (direction == 'BOS Down' and row['low'] <= tp1)):
+        if not tp1_hit and ((direction == 'BOS Up' and row.high >= tp1) or
+                            (direction == 'BOS Down' and row.low <= tp1)):
             tp1_hit = True
             continue
 
         # 🟡 SL after TP1
-        if tp1_hit and ((direction == 'BOS Up' and row['low'] <= sl) or
-                        (direction == 'BOS Down' and row['high'] >= sl)):
+        if tp1_hit and ((direction == 'BOS Up' and row.low <= sl) or
+                        (direction == 'BOS Down' and row.high >= sl)):
             profit = (0.8 * 3 - 0.2) * RISK_PER_TRADE
-            print(f"    🟡 Final SL after TP1 at {row['time']} → +{profit:.2f} USD")
+            if VERBOSE:
+                print(f"    🟡 Final SL after TP1 at {row.time} → +{profit:.2f} USD")
             total_sl5 += profit
             ACCOUNT_BALANCE += profit
-            print(f"    📉 New Account Balance: ${ACCOUNT_BALANCE:,.2f}")
+            if VERBOSE:
+                print(f"    📉 New Account Balance: ${ACCOUNT_BALANCE:,.2f}")
 
-            equity_time.append(row['time'])
+            equity_time.append(row.time)
             equity_curve.append(ACCOUNT_BALANCE)
             day_stats[entry_time.weekday()]['SL5'] += 1
             trade_logs.append({
                 "entry_time": entry_time,
-                "exit_time": row['time'],
+                "exit_time": row.time,
                 "pnl": profit,
                 "direction": "BUY" if direction == "BOS Up" else "SELL",
                 "sl_distance": stop_distance,
                 "fvg_size": fvg_range,
                 "entry_px": entry_price,
-                "exit_px": row['close'],
+                "exit_px": row.close,
                 "sl_px": sl,
                 "tp1_px": tp1,
                 "tp2_px": tp2,
                 "balance": ACCOUNT_BALANCE
             })
-            exit_time = row['time']
-            result_label = "SL5"
-            #plot_trade_chart_interactive(df_full, entry_time, exit_time, entry_price, sl, tp1, tp2, result_label)
-
+            if ACCOUNT_BALANCE <= 180_000 and VERBOSE:
+                print(f"💥 Account liquidated at {row.time}. Resetting to 200,000 USD.")
             if ACCOUNT_BALANCE <= 180_000:
-                print(f"💥 Account liquidated at {row['time']}. Resetting to 200,000 USD.")
                 LIQUIDATED_COUNT += 1
                 ACCOUNT_BALANCE = 200_000
-                equity_time.append(row['time'])
+                equity_time.append(row.time)
                 equity_curve.append(ACCOUNT_BALANCE)
 
             return
 
         # 🏁 TP2 hit
-        if tp1_hit and ((direction == 'BOS Up' and row['high'] >= tp2) or
-                        (direction == 'BOS Down' and row['low'] <= tp2)):
+        if tp1_hit and ((direction == 'BOS Up' and row.high >= tp2) or
+                        (direction == 'BOS Down' and row.low <= tp2)):
 
             profit = (0.8 * 3 + 0.2 * 6) * RISK_PER_TRADE
-            print(f"    🏁 TP2 HIT at {row['time']} → +{profit:.2f} USD")
+            if VERBOSE:
+                print(f"    🏁 TP2 HIT at {row.time} → +{profit:.2f} USD")
             total_tp5 += profit
             ACCOUNT_BALANCE += profit
-            print(f"    📉 New Account Balance: ${ACCOUNT_BALANCE:,.2f}")
-            equity_time.append(row['time'])
+            if VERBOSE:
+                print(f"    📉 New Account Balance: ${ACCOUNT_BALANCE:,.2f}")
+            equity_time.append(row.time)
             equity_curve.append(ACCOUNT_BALANCE)
             day_stats[entry_time.weekday()]['TP5'] += 1
             trade_logs.append({
                 "entry_time": entry_time,
-                "exit_time": row['time'],
+                "exit_time": row.time,
                 "pnl": profit,
                 "direction": "BUY" if direction == "BOS Up" else "SELL",
                 "sl_distance": stop_distance,
                 "fvg_size": fvg_range,
                 "entry_px": entry_price,
-                "exit_px": row['close'],
+                "exit_px": row.close,
                 "sl_px": sl,
                 "tp1_px": tp1,
                 "tp2_px": tp2,
                 "balance": ACCOUNT_BALANCE
             })
-            exit_time = row['time']
-            result_label = "TP2"
-            #plot_trade_chart_interactive(df_full, entry_time, exit_time, entry_price, sl, tp1, tp2, result_label)
-
+            if ACCOUNT_BALANCE <= 180_000 and VERBOSE:
+                print(f"💥 Account liquidated at {row.time}. Resetting to 200,000 USD.")
             if ACCOUNT_BALANCE <= 180_000:
-                print(f"💥 Account liquidated at {row['time']}. Resetting to 200,000 USD.")
                 LIQUIDATED_COUNT += 1
                 ACCOUNT_BALANCE = 200_000
-                equity_time.append(row['time'])
+                equity_time.append(row.time)
                 equity_curve.append(ACCOUNT_BALANCE)
 
             return
@@ -415,36 +455,38 @@ def detect_bos(df_1m, sweep_dir, sweep_time):
         if sweep_dir == 'low':
             for ft, price in reversed(fractal_highs):
                 if ft < candle['time'] and body_high > price:
-                    print(f"  ↳ BOS Up: candle closed above fractal HIGH {price:.2f} (fract. at {ft}, BOS candle at {candle['time']})")
+                    if VERBOSE:
+                        print(f"  ↳ BOS Up: candle closed above fractal HIGH {price:.2f} (fract. at {ft}, BOS candle at {candle['time']})")
                     return candle['time'], 'BOS Up', ft
         elif sweep_dir == 'high':
             for ft, price in reversed(fractal_lows):
                 if ft < candle['time'] and body_low < price:
-                    print(f"  ↳ BOS Down: candle closed below fractal LOW {price:.2f} (fract. at {ft}, BOS candle at {candle['time']})")
+                    if VERBOSE:
+                        print(f"  ↳ BOS Down: candle closed below fractal LOW {price:.2f} (fract. at {ft}, BOS candle at {candle['time']})")
                     return candle['time'], 'BOS Down', ft
     return None, None, None
 
 
 
-def detect_sweep_and_bos(df_15m, df_1m):
+def detect_sweep_and_bos(df_15m, df_1m_all, daily_15m, daily_1m):
 
-    df_15m['date'] = df_15m['time'].dt.date
-    for day in df_15m['date'].unique():
-        day_15m = df_15m[df_15m['date'] == day]
-        day_1m = df_1m[df_1m['time'].dt.date == day]
+    for day, day_15m in daily_15m.items():
+        day_1m = daily_1m.get(day)
+        if day_1m is None:
+            continue
 
         daily_fvgs = find_real_fvgs_custom(day_1m)
-        #day_1m["ATR"] = calculate_atr(day_1m)
 
-        #inside the loop:
-        if day_15m['time'].dt.weekday.iloc[0] in SKIP_WEEKDAYS:
+        weekday = day_15m['weekday'].iloc[0]
+        if weekday in SKIP_WEEKDAYS:
             continue
         if len(day_15m) < 20 or len(day_1m) < 100:
             continue
         try:
             # Define both sweep windows
-            primary_sweep_start = NY_TZ.localize(datetime.combine(day, time(20, 00)))
-            primary_sweep_end = NY_TZ.localize(datetime.combine(day, time(22, 00)))
+            day_date = day.to_pydatetime().date()
+            primary_sweep_start = NY_TZ.localize(datetime.combine(day_date, time(20, 00)))
+            primary_sweep_end = NY_TZ.localize(datetime.combine(day_date, time(22, 00)))
             #fallback_sweep_start = NY_TZ.localize(datetime.combine(day, time(21, 0)))
             #fallback_sweep_end = NY_TZ.localize(datetime.combine(day, time(23, 0)))
 
@@ -454,25 +496,28 @@ def detect_sweep_and_bos(df_15m, df_1m):
             df_1m_pre = day_1m[day_1m['time'] <= primary_sweep_start]
             swing_highs, swing_lows = find_fractal_highs_lows(df_15m_pre)
 
+            pre_times = df_1m_pre['time'].to_numpy()
+            pre_highs = df_1m_pre['high'].to_numpy()
+            pre_lows = df_1m_pre['low'].to_numpy()
             last_unswept_high = last_unswept_low = None
             for t, price in reversed(swing_highs):
-                if not any(df_1m_pre[df_1m_pre['time'] > t]['high'] > price):
+                if not (pre_highs[pre_times > t] > price).any():
                     last_unswept_high = (t, price)
                     break
             for t, price in reversed(swing_lows):
-                if not any(df_1m_pre[df_1m_pre['time'] > t]['low'] < price):
+                if not (pre_lows[pre_times > t] < price).any():
                     last_unswept_low = (t, price)
                     break
 
             sweep_dir = sweep_time = bos_time = bos_label = fractal_time = None
 
             df_post_sweep = day_1m[(day_1m['time'] >= primary_sweep_start) & (day_1m['time'] <= primary_sweep_end)]
-            for _, row in df_post_sweep.iterrows():
-                if last_unswept_high and row['high'] > last_unswept_high[1]:
-                    sweep_dir, sweep_time = 'high', row['time']
+            for row in df_post_sweep.itertuples(index=False):
+                if last_unswept_high and row.high > last_unswept_high[1]:
+                    sweep_dir, sweep_time = 'high', row.time
                     break
-                if last_unswept_low and row['low'] < last_unswept_low[1]:
-                    sweep_dir, sweep_time = 'low', row['time']
+                if last_unswept_low and row.low < last_unswept_low[1]:
+                    sweep_dir, sweep_time = 'low', row.time
                     break
 
             # ========== FALLBACK WINDOW: 21:00–23:00 ==========
@@ -513,13 +558,15 @@ def detect_sweep_and_bos(df_15m, df_1m):
             if bos_time is None:
                 continue  # no BOS detected
 
-            print(f"[{day}] Sweep {sweep_dir.upper()} at {sweep_time} | BOS at {bos_time}")
-            full_after_sweep = df_1m[df_1m['time'] >= sweep_time]
+            if VERBOSE:
+                print(f"[{day_date}] Sweep {sweep_dir.upper()} at {sweep_time} | BOS at {bos_time}")
+            full_after_sweep = df_1m_all[df_1m_all['time'] >= sweep_time]
             simulate_trade(day_1m, bos_time, fractal_time, bos_label, full_after_sweep, sweep_time, daily_fvgs)
 
 
         except Exception as e:
-            print(f"Error on {day}: {e}")
+            if VERBOSE:
+                print(f"Error on {day_date}: {e}")
             continue
 
 
@@ -662,22 +709,16 @@ def print_trade_summary():
 
 
 if __name__ == '__main__':
-    df_15m = pd.read_csv("2015-2025M15.csv")
-    df_1m = pd.read_csv("2015-2025M1.csv")
+    df_15m = load_and_cache("2015-2025M15.csv", "2015-2025M15.pkl")
+    df_1m = load_and_cache("2015-2025M1.csv", "2015-2025M1.pkl")
 
-    rename_map = {'Gmt time':'time','Open':'open','High':'high','Low':'low','Close':'close','Volume':'volume'}
-    df_15m.rename(columns=rename_map,inplace=True)
-    df_1m.rename(columns=rename_map,inplace=True)
+    daily_15m = build_daily_map(df_15m)
+    daily_1m = build_daily_map(df_1m)
 
-    for df in (df_15m, df_1m):
-        df['time'] = pd.to_datetime(df['time'], format='%Y-%m-%d %H:%M:%S')
-        df['time'] = df['time'].dt.tz_localize('Etc/GMT-3').dt.tz_convert('America/New_York')
-
-    detect_sweep_and_bos(df_15m, df_1m)
+    detect_sweep_and_bos(df_15m, df_1m, daily_15m, daily_1m)
     print("1-Minute Data Range:")
     print("Start:", df_1m['time'].min())
     print("End:  ", df_1m['time'].max())
     print("Total Days Covered:", (df_1m['time'].max() - df_1m['time'].min()).days)
-
 
     print_trade_summary()
