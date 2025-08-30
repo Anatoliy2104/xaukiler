@@ -1,167 +1,195 @@
-# Backtest Speed-Up — **Codex Implementation README**
+# XAUUSD Sweep→BOS→FVG Backtester (FTMO‑aware)
 
-**Goal:** Reduce backtest time from ~1.5h → **≤ 30 min** (CPU) **without changing any strategy logic** or trade outcomes.
-
-This README tells Codex (and any developer) exactly what to change, where, and how to verify that results remain identical.
+This repository contains a single script, `fast.py`, that backtests a **sweep → BOS (break of structure) → FVG** entry model on **XAU/USD** using 1‑minute and 15‑minute CSV data. It includes **FTMO‑style risk/margin constraints**, monthly withdrawals back to a base balance, and liquidation resets. It saves equity charts, trade logs, and a monthly PnL + withdrawals snapshot for review.
 
 ---
 
-## Repository Context
+## TL;DR
 
-- **Main script:** `slow.py`
-- **Data:** `2015-2025M1.csv`, `2015-2025M15.csv`
-- **Outputs:** `charts/` (trade logs, equity, images)
-- **Timezone rule:** Load CSV in `Etc/GMT-3`, convert to `America/New_York` (keep identical).
-
-> **Hard rule:** *Do not change trading logic or thresholds.* All modifications are performance-only.
-
----
-
-## Performance Strategy (No-Logic-Change)
-
-1. **Cache parsed data (first run only; reuse next runs).**
-   - Read CSV → rename columns → parse `time` → localize to `Etc/GMT-3` → convert to `America/New_York`.
-   - Add `date = time.normalize()` (tz-aware midnight).
-   - Save **binary cache** per file (e.g., `2015-2025M1.pkl`, `2015-2025M15.pkl`).  
-   - On subsequent runs: **load the pickle** instead of CSV.
-
-2. **Pre-group once for O(1) daily access.**
-   - Build maps once: `daily_15m = {date: day_df}`, `daily_1m = {date: day_df}` via `groupby('date')`.
-   - In the daily loop use dictionary lookups, not boolean masks like `df['time'].dt.date == day`.
-
-3. **Preserve cross-midnight exits.**
-   - Use the **daily** slices only for sweep/BOS detection.
-   - For trade simulation after entry, keep a **global `after_sweep` M1 window** (`time >= sweep_time`) so exits can occur after midnight exactly as in `slow.py`.
-
-4. **Use faster row access (same values).**
-   - Replace slow row iteration with **tuple-style access** (no logic edits) in:
-     - Post-sweep scan (find sweep candle).
-     - Post-entry scan (SL/TP1/TP2 event ordering).
-
-5. **Find BOS index within the day slice.**
-   - Locate `bos_time` inside the day’s 1m DataFrame (small search).
-   - Still use the global `after_sweep` for exits (see #3).
-
-6. **Remove hot-loop I/O.**
-   - Silence frequent `print()` in tight loops behind a `VERBOSE` flag (default OFF).
-   - Defer all file writes and chart rendering until **after** the simulation finishes.
-
-7. **Micro-optimizations (safe).**
-   - Reuse precomputed `date` and `weekday` (first row of the day slice) for skip logic.
-   - Avoid creating many temporary DataFrames inside loops when arrays from the slice suffice.
-
-8. **Optional accelerators (only if needed).**
-   - Numba-JIT the post-entry event scanner (pure numpy arrays; same thresholds/order).
-   - Parallelize **indicator precomputation** per day (not the simulation state machine).
+- Put two CSVs in the working folder: `2015-2025M15.csv` and `2015-2025M1.csv` (schema below).
+- Run:  
+  ```bash
+  python fast.py
+  ```
+- Outputs land in `charts/…`:
+  - `charts/trades_full.csv`, `charts/trades_lite.csv`
+  - `charts/equity_yearly/equity_<YEAR>_months.png`
+  - `charts/equity_curve_xau_2009_2016.csv` (equity timeseries)
+  - `charts/monthly_pnl_and_withdrawals.txt`
+- Optional: set `DEBUG = True` at the top for verbose trace.
 
 ---
 
-## Concrete Tasks for Codex
+## Requirements
 
-**T1 — Add a cached loader**  
-Create a helper that:
-- Accepts (`csv_path`, `pkl_path`, `rename_map`, `src_tz='Etc/GMT-3'`, `dst_tz='America/New_York'`).
-- On first run: read CSV, rename columns, parse & tz-convert `time`, set `date = time.normalize()`, then `to_pickle(pkl_path)`.
-- On later runs: `read_pickle(pkl_path)`.
-- Guarantee `'date'` exists (for old caches).
+- **Python 3.9+**
+- Libraries: `pandas`, `pytz`, `matplotlib`, `tqdm` (optional; the script gracefully falls back if missing)
 
-**T2 — Build daily maps once**  
-Create `build_daily_maps(df_15m, df_1m)` to return `{date: df}` dicts using `groupby('date', sort=False)`.
-
-**T3 — Fast sweep/BOS loop**  
-Add a function like `detect_sweep_and_bos_fast(daily_15m, daily_1m)` that mirrors `detect_sweep_and_bos` logic but:
-- Iterates `for date, day_15m in daily_15m.items()`.
-- Fetches `day_1m = daily_1m.get(date)`.
-- Uses tuple-style iteration to find the first sweep in the primary window.
-- Calls the existing `detect_bos(...)` unchanged.
-- Creates `full_after_sweep` from the **global M1 DataFrame** (`time >= sweep_time`).
-
-**T4 — Fast simulate (same logic)**  
-Add a `simulate_trade_fast(...)` that is **logic-identical** to `simulate_trade(...)` but:
-- Works with day slices for BOS index lookup.
-- Uses tuple-style iteration for post-BOS and post-entry scans.
-- Keeps the same SL/TP order and account updates, withdrawals, liquidation rules.
-
-**T5 — Main switches to cache + fast path**  
-In `__main__`:
-- Replace CSV direct loads with **T1 cached loader** for both files.
-- Build **T2** maps.
-- Call **T3** fast detector instead of the original function.
-- Keep the equity/summary/reporting code as is.
-
-**T6 — Logging control**  
-Introduce `VERBOSE = False` and route non-critical prints through a `log(...)` helper.  
-Keep critical events (`ENTRY`, `SL`, `TP1`, `TP2`, withdrawals, liquidations) printed as before.
-
-**T7 — Avoid equality lookups across 10y data**  
-When locating `bos_time`, find it **within the day slice**, not via a global search.
-
-**T8 — Keep cross-midnight behavior**  
-Ensure `after_entry` scanning uses the **global** `df_full = df_1m[df_1m['time'] > entry_time]` derived from `time >= sweep_time` (as in `slow.py`).
-
-**T9 — I/O discipline**  
-Do not write files or render charts inside the hot loops. Aggregate in-memory and write once at the end (already mostly true).
-
-**T10 — (Optional) Numba on post-entry scanner**  
-If needed for further speed, move the event scan (after entry) into a Numba-compiled function that receives arrays of highs/lows (and thresholds) and returns which event hit first and when. Do not change event precedence.
+Install:
+```bash
+python -m venv .venv
+# Windows
+.venv\Scripts\pip install pandas pytz matplotlib tqdm
+# macOS/Linux
+source .venv/bin/activate && pip install pandas pytz matplotlib tqdm
+```
 
 ---
 
-## Non‑Negotiables (Do Not Change)
+## Data Inputs
 
-- All thresholds, comparisons, and order of checks (SL before TP1; TP1 gating for TP2/SL-after-TP1) must remain **exactly** as in `slow.py`.
-- Monthly withdrawal/reset rules and liquidation threshold must be **identical**.
-- Timezone pipeline (CSV tz localize → convert) must be **identical**.
-- FVG/fractal detection logic and inputs must be **identical**.
-- Exits can happen after midnight (do not cap to a day).
+The script expects two CSV files in the current directory:
 
----
+- `2015-2025M15.csv` — 15‑minute bars
+- `2015-2025M1.csv` — 1‑minute bars
 
-## Acceptance Criteria (Regression Gate)
+**Required columns** (exact names):  
+`Gmt time, Open, High, Low, Close, Volume`
 
-1. **Trade equality**  
-   - `trades_full.csv` after the run matches baseline 1:1 on:  
-     `entry_time, exit_time, pnl, sl_distance, fvg_size, direction, entry_px, exit_px, sl_px, tp1_px, tp2_px, balance`.
-
-2. **Counts match**  
-   - Same number of trades, skips, withdrawals (months and amounts), liquidations (count and timestamps).
-
-3. **Equity curve equality**  
-   - `equity_time` and `equity_curve` sequences identical (timestamp-by-timestamp).
-
-4. **Spot checks**  
-   - Manually inspect a few days with cross-midnight exits—identical events and ordering.
-
-5. **Performance**  
-   - Full 2015–2025 run completes in **≤ 30 minutes** on CPU.
-
-> If any check fails, revert only the last change and re‑test. Do not “fix” by adjusting thresholds or logic.
+**Datetime format:** `YYYY-MM-DD HH:MM:SS` (no timezone in the string).  
+The script converts times from `Etc/GMT-3` to `America/New_York` internally.
 
 ---
 
-## Runbook
+## What the Strategy Does (high level)
 
-1. **First run (build caches):** run the script once to generate `.pkl` caches from CSVs.  
-2. **Subsequent runs:** script should auto‑load `.pkl` and skip CSV parsing/tz conversion.  
-3. **Logs & charts:** produced at end as usual under `charts/`.
-4. **Toggle verbosity:** set `VERBOSE = True` only when debugging—expect a slowdown.
-
----
-
-## Notes for Future Work (still logic‑safe)
-- If more speed is required, prefer **Numba** on the post-entry scanner before attempting full simulation parallelism (stateful month boundaries make parallelization tricky).  
-- If you parallelize anything now, limit it to **indicator precomputation per day** and merge results before simulation.
-
----
-
-## File Checklist (post‑implementation)
-
-- `slow.py` (updated with cached loader, daily maps, fast detectors)
-- `2015-2025M1.pkl`, `2015-2025M15.pkl` (auto-generated on first run)
-- `charts/trades_full.csv`, `charts/trades_lite.csv` (unchanged schema)
-- `charts/equity_yearly/*.png` (optional during dev; generate on demand)
+1. **Day slicing:** For each trading day it prepares 15m and 1m slices.
+2. **Find “last unswept” 15m swing** before 20:00 New York.
+3. **Primary sweep window:** Detects if that swing is swept **between 20:00 and 22:00 New York** on 1m data.
+4. **BOS detection:** After the sweep, finds a 1m candle that closes beyond the *opposite* fractal (with a small look‑back), **and confirms a valid “real FVG.”**
+5. **Entry:** Chooses the matching FVG (same direction as BOS). Entry = **midpoint of the FVG** after price first leaves the FVG and then returns. Entries at/after **22:00** are skipped.
+6. **Stops & Targets:**
+   - **SL** at the nearest opposing fractal ± a buffer (buffer = 90% of the FVG range).
+   - **TP1 = 3R**, **TP2 = 6R** (R = risk used on the trade).
+   - After TP1, 80% is treated as banked; if SL later hits, net ≈ **+2.2R**; if TP2 hits, net ≈ **+4.2R**.
+7. **Sizing & FTMO constraints:**
+   - If stop distance ≥ threshold, risk the **full amount** (configurable).
+   - Otherwise, cap by **max lot**, **lot step**, and **per‑lot margin**; also respect a **free‑margin cap**.
+8. **Accounting model:**
+   - **Monthly withdrawal**: on month change, withdraw any balance above **$100,000** and reset to $100k.
+   - **Liquidation**: if balance ≤ **$90,000** after a trade, count a liquidation and reset to $100k.
 
 ---
 
-**Owner:** Anatoliy  
-**SLO:** ≤ 30 min full backtest, identical outputs to pre‑optimization baseline.
+## Configuration (edit at the top of `fast.py`)
+
+| Name | Purpose | Default |
+|---|---|---|
+| `ACCOUNT_BALANCE` | Starting balance | `100_000` |
+| `PIP_VALUE_PER_LOT` | Pip value per lot (XAUUSD) | `100.0` |
+| `RISK_FULL` | Full risk per trade (used when SL ≥ threshold) | `3000` |
+| `SL_THRESHOLD_FULL_RISK` | SL distance threshold to allow full risk | `3.9` |
+| `MAX_LOT` | Absolute lot cap | `7.8` |
+| `MAX_FREE_MARGIN` | Upper bound used for margin sizing | `90_000.0` |
+| `MARGIN_PER_LOT_BUY` | Per‑lot margin (buy) | `11467.02` |
+| `MARGIN_PER_LOT_SELL` | Per‑lot margin (sell) | `11466.06` |
+| `LOT_STEP` | Lot granularity | `0.01` |
+| `DEBUG` | Verbose prints | `False` |
+
+**Time windows & timezone**
+- All internal logic is in **America/New_York** time.
+- Primary sweep window: **20:00–22:00 NY**.
+- No entries after **22:00 NY**.
+
+---
+
+## File Outputs
+
+- **Equity curve CSV**: `charts/equity_curve_xau_2009_2016.csv`
+- **Yearly equity plots**: `charts/equity_yearly/equity_<YEAR>_months.png` (month gridlines included)
+- **Trades CSVs**:  
+  - `charts/trades_full.csv` (all trade fields, including prices, distances, running balance)  
+  - `charts/trades_lite.csv` (compact: entry, exit, direction, pnl, risk, lots)
+- **Monthly PnL + Withdrawals**: `charts/monthly_pnl_and_withdrawals.txt`
+- **Console summary**: SL/TP buckets, skipped, per‑weekday counts, monthly PnL printout, withdrawals list and total, 1m data coverage and runtime.
+
+> Tip: the script also keeps an in‑memory `WITHDRAWAL_LOG` and prints a **Total Withdrawals** figure at the end.
+
+---
+
+## CSV Schema Notes
+
+The script renames columns internally:
+```
+'Gmt time' -> 'time'
+'Open'     -> 'open'
+'High'     -> 'high'
+'Low'      -> 'low'
+'Close'    -> 'close'
+'Volume'   -> 'volume'
+```
+It then parses `'time'` with `format='%Y-%m-%d %H:%M:%S'`, localizes from `Etc/GMT-3`, and converts to `America/New_York`.
+
+---
+
+## Internals (for reviewers)
+
+- **Fractals:** 5‑bar swing highs/lows on the active dataframe (works for 15m or 1m slices).
+- **FVG filter:** Custom “real FVG” check over 3 consecutive candles with a **minimum gap size** (default `0.2`). The BOS candle’s mini‑window must include such an FVG; the final trade uses an FVG between the fractal and BOS that matches the BOS direction.
+- **Entry rule:** Wait for price to **leave** the FVG, then **return** to the FVG midpoint to fill.
+- **Bucketed outcomes:**  
+  - SL before TP1 → **SL2** (−1R)  
+  - TP1 then SL → **SL5** (+2.2R)  
+  - TP1 then TP2 → **TP5** (+4.2R)
+- **Accounting:**  
+  - **Monthly withdrawals**: on month change, if balance > 100k, withdraw the difference (log month + amount) and set balance back to 100k.  
+  - **Liquidations**: if balance ≤ 90k at exit, increment a counter and immediately reset to 100k (equity curve continues).
+
+---
+
+## How to Run
+
+1. Place the two CSVs in the working directory.
+2. (Optional) Tweak configuration at the top of `fast.py`.
+3. Run:
+   ```bash
+   python fast.py
+   ```
+4. Inspect outputs under `charts/` and check the console summary.
+
+---
+
+## Verifying Against a Reference Withdrawals List
+
+At the bottom of the script there’s `EXPECTED_WITHDRAWALS` and a helper `verify_withdrawals(...)`. By default it prints whether the run matches the list. You can set `raise_on_mismatch=True` to hard‑fail the run if they differ.
+
+Example:
+```python
+verify_withdrawals(raise_on_mismatch=True)
+```
+
+If your data source or settings change, update `EXPECTED_WITHDRAWALS` accordingly.
+
+---
+
+## Customization Ideas
+
+- Change the **sweep window** or **entry cutoff** hour.
+- Adjust **FVG minimum size**, **buffer %**, or **risk/threshold** parameters.
+- Swap per‑lot margin numbers or **max lot** to reflect a different broker/product.
+- Log additional diagnostics to `charts/html` or add per‑trade charts.
+
+---
+
+## Troubleshooting
+
+- **“No valid FVG found between fractal and BOS.”**  
+  The BOS mini‑window did not meet the FVG criteria; try reducing the FVG size threshold or review the day’s structure.
+
+- **“Entry not triggered.”**  
+  Price did not return to the FVG midpoint after leaving it, or it happened after 22:00.
+
+- **“Not enough margin for min lot.”**  
+  With the current per‑lot margin and caps, lot size could not reach the minimum `LOT_STEP`. Increase `MAX_FREE_MARGIN`/`MAX_LOT` or use full‑risk mode by increasing the SL threshold and/or typical SL distances.
+
+- **Equity plots look empty/weird.**  
+  Check timezone conversions and make sure the CSVs actually cover the 20:00–22:00 New York window.
+
+- **Withdrawal mismatch.**  
+  Either update `EXPECTED_WITHDRAWALS` or ensure you’re using the same dataset and parameters as the reference.
+
+---
+
+## License
+
+Proprietary/backtest‑lab use. Adapt as needed within your project.
