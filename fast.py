@@ -35,6 +35,7 @@ day_stats = {i: {'SL2': 0, 'SL5': 0, 'TP5': 0} for i in range(7)}
 ACCOUNT_BALANCE = 100_000
 RISK_PER_TRADE = 2000  # legacy default, replaced by dynamic risk rules
 PIP_VALUE_PER_LOT = 100.0
+MIN_STOP_DISTANCE = 0.20
 
 RISK_FULL = 3000
 SL_THRESHOLD_FULL_RISK = 3.9
@@ -178,11 +179,6 @@ def simulate_trade(df_1m, bos_time, fractal_time, direction, df_full, sweep_time
         total_skips += 1
         return
 
-    if entry_time.hour >= 22:  # same guard
-        if DEBUG: print(f"    ⛔ Entry at {entry_time} skipped.")
-        total_skips += 1
-        return
-
     if DEBUG:
         print(f"    📥 ENTRY at {entry_time} | Price: {entry_price:.2f}")
         print(f"    🔍 FVG Time: {fvg_time} | FVG Range: {fvg_bottom:.2f} - {fvg_top:.2f}")
@@ -191,18 +187,24 @@ def simulate_trade(df_1m, bos_time, fractal_time, direction, df_full, sweep_time
     fractal_highs, fractal_lows = find_fractal_highs_lows(window_df)
 
     fvg_range = fvg_top - fvg_bottom
-    buffer = 0.9 * fvg_range
+    buffer = 0.5 * fvg_range
 
     if direction == 'BOS Up':
         sl = min(price for t, price in fractal_lows) if fractal_lows else fvg_bottom
         sl -= buffer
         stop_distance = entry_price - sl
+        if stop_distance < MIN_STOP_DISTANCE:
+            stop_distance = MIN_STOP_DISTANCE
+            sl = entry_price - stop_distance
         tp1 = entry_price + 3 * stop_distance
         tp2 = entry_price + 6 * stop_distance
     else:
         sl = max(price for t, price in fractal_highs) if fractal_highs else fvg_top
         sl += buffer
         stop_distance = sl - entry_price
+        if stop_distance < MIN_STOP_DISTANCE:
+            stop_distance = MIN_STOP_DISTANCE
+            sl = entry_price + stop_distance
         tp1 = entry_price - 3 * stop_distance
         tp2 = entry_price - 6 * stop_distance
 
