@@ -57,9 +57,9 @@ The script converts times from `Etc/GMT-3` to `America/New_York` internally.
 2. **Find “last unswept” 15m swing** before 20:00 New York.
 3. **Primary sweep window:** Detects if that swing is swept **between 20:00 and 22:00 New York** on 1m data.
 4. **BOS detection:** After the sweep, finds a 1m candle that closes beyond the *opposite* fractal (with a small look‑back), **and confirms a valid “real FVG.”**
-5. **Entry:** Chooses the matching FVG (same direction as BOS). Entry = **midpoint of the FVG** after price first leaves the FVG and then returns. Entries at/after **22:00** are skipped.
+5. **Entry:** Chooses the matching FVG (same direction as BOS). Entry = **midpoint of the FVG** after price first leaves the FVG and then returns.
 6. **Stops & Targets:**
-   - **SL** at the nearest opposing fractal ± a buffer (buffer = 90% of the FVG range).
+   - **SL** at the nearest opposing fractal ± a buffer (buffer = 50% of the FVG range, minimum stop distance = 0.20).
    - **TP1 = 3R**, **TP2 = 6R** (R = risk used on the trade).
    - After TP1, 80% is treated as banked; if SL later hits, net ≈ **+2.2R**; if TP2 hits, net ≈ **+4.2R**.
 7. **Sizing & FTMO constraints:**
@@ -84,12 +84,12 @@ The script converts times from `Etc/GMT-3` to `America/New_York` internally.
 | `MARGIN_PER_LOT_BUY` | Per‑lot margin (buy) | `11467.02` |
 | `MARGIN_PER_LOT_SELL` | Per‑lot margin (sell) | `11466.06` |
 | `LOT_STEP` | Lot granularity | `0.01` |
+| `MIN_STOP_DISTANCE` | Minimum allowed stop distance (price units) | `0.20` |
 | `DEBUG` | Verbose prints | `False` |
 
 **Time windows & timezone**
 - All internal logic is in **America/New_York** time.
 - Primary sweep window: **20:00–22:00 NY**.
-- No entries after **22:00 NY**.
 
 ---
 
@@ -164,7 +164,7 @@ If your data source or settings change, update `EXPECTED_WITHDRAWALS` accordingl
 
 ## Customization Ideas
 
-- Change the **sweep window** or **entry cutoff** hour.
+- Change the **sweep window** or other parameters.
 - Adjust **FVG minimum size**, **buffer %**, or **risk/threshold** parameters.
 - Swap per‑lot margin numbers or **max lot** to reflect a different broker/product.
 - Log additional diagnostics to `charts/html` or add per‑trade charts.
@@ -176,8 +176,8 @@ If your data source or settings change, update `EXPECTED_WITHDRAWALS` accordingl
 - **“No valid FVG found between fractal and BOS.”**  
   The BOS mini‑window did not meet the FVG criteria; try reducing the FVG size threshold or review the day’s structure.
 
-- **“Entry not triggered.”**  
-  Price did not return to the FVG midpoint after leaving it, or it happened after 22:00.
+- **“Entry not triggered.”**
+  Price did not return to the FVG midpoint after leaving it.
 
 - **“Not enough margin for min lot.”**  
   With the current per‑lot margin and caps, lot size could not reach the minimum `LOT_STEP`. Increase `MAX_FREE_MARGIN`/`MAX_LOT` or use full‑risk mode by increasing the SL threshold and/or typical SL distances.
